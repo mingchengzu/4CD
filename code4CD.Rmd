@@ -1,0 +1,1339 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Filter data and save exports
+```{r message=FALSE, warning=FALSE}
+rm(list = ls())
+CD_Raw = openxlsx::read.xlsx("data/count.annot-preprogressed.xlsx", rowNames = TRUE)
+exp = CD_Raw
+library(edgeR)
+nrow(exp)
+# CPM >10 in more than 90% of samples were retained
+keep <- rowSums(cpm(exp) > 0.5) >= 0.9*ncol(exp)
+table(keep)
+CD2use = exp[keep,]
+nrow(CD2use)
+save(CD2use, file = "data/CD2use.Rdata")
+openxlsx::write.xlsx(CD2use,file="data/CD2use.xlsx",rowNames = TRUE)
+```
+
+# VST
+```{r message=FALSE, warning=FALSE}
+library(DESeq2)
+library(writexl)
+group_list = c(rep("CD", times = 25),rep("HC", times = 18))
+colData <- data.frame(row.names=colnames(CD2use), group_list=group_list)
+dds <- DESeqDataSetFromMatrix(countData = CD2use,
+                              colData = colData,
+                              design = ~ group_list)
+dds
+CD_vst <- varianceStabilizingTransformation(dds, blind = FALSE)
+CD_vst2use = assay(CD_vst)
+head(CD_vst2use, 3)
+save(CD_vst2use, file = "data/CD_vst2use.Rdata")
+write.csv(CD_vst2use,file ="data/CD_vst2use.csv",
+          row.names =T)
+```
+
+# Run WGCNA
+## Setup and read in data
+```{r message=FALSE, warning=FALSE}
+# Libraries
+library(easypackages)
+libraries("WGCNA","gplots","ggplot2", "png","Cairo","here","openxlsx")
+
+# Allow multi-threading within WGCNA
+allowWGCNAThreads()
+
+# WGCNA parameters
+networkType = 'signed'     
+tomType = 'signed'
+corrType = 'bicor'
+maxBlockSize = 30000
+minModSize = 100
+modMergeCutHeight = 0.25
+deepSplit = 4
+
+resultpath = "results/wgcna/"
+
+
+# Read in data
+load(file="data/CD_vst2use.Rdata")
+labelData = openxlsx::read.xlsx("data/labelData.xlsx")
+datTraits = read.csv("data/datTraits.csv")
+datExpr = t(CD_vst2use)
+```
+
+## Choose soft-threshold power
+```{r message=FALSE, warning=FALSE}
+powers = c(1:35)
+if (corrType=="pearson"){
+  corFnc2use = "cor"
+}else if (corrType=="bicor"){
+  corFnc2use = corrType
+}
+sft = pickSoftThreshold(datExpr, 
+                        powerVector = powers, 
+                        verbose = 5, 
+                        networkType = networkType, 
+                        corFnc = corrType)
+
+makeSoftPowerPlot <- function(sft, powers, cex1 = 0.8){
+  # Scale-free topology fit index as a function of the soft-thresholding power
+  par(mfrow = c(1,2))
+  plot(sft$fitIndices[,1], 
+       -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+       xlab = "Soft Threshold (power)",
+       ylab = "Scale Free Topology Model Fit,signed R^2",
+       type = "n",
+       main = paste("Scale independence"),
+       dpi = 1200)
+  text(sft$fitIndices[,1], 
+       -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+       labels = powers,
+       cex = cex1,
+       col = "red")
+  abline(h = 0.80, col = "red")
+  ## Mean connectivity as a function of the soft-threshold power
+  plot(sft$fitIndices[,1], 
+       sft$fitIndices[,5],
+       xlab="Soft Threshold (power)",
+       ylab="Mean Connectivity", 
+       type="n",
+       main = "Mean connectivity",
+       dpi =1200)
+  text(sft$fitIndices[,1], 
+       sft$fitIndices[,5], 
+       labels=powers, 
+       cex=cex1,
+       col="red")
+}
+
+makeSoftPowerPlot(sft = sft, powers = powers)
+write.csv(sft[["fitIndices"]],file = "results/wgcna/sft.csv")
+
+```
+
+## Run blockwiseModules
+```{r message=FALSE, warning=FALSE}
+softPower = 26
+
+## Run an automated network analysis
+net3 = blockwiseModules(datExpr,
+                         power = softPower,
+                         deepSplit = deepSplit,
+                         minModuleSize = minModSize,
+                         mergeCutHeight = modMergeCutHeight, 
+                         detectCutHeight = 0.9999,
+                         corType = corrType,
+                         networkType = networkType,
+                         pamStage = FALSE,
+                         pamRespectsDendro = TRUE,
+                         verbose = 3,
+                         saveTOMs = FALSE,
+                         maxBlockSize = maxBlockSize, 
+                         numericLabels = TRUE)
+
+net3$moduleNumbers = net3$colors
+net3$colors = labels2colors(net3$moduleNumbers)
+
+moduleLabels = net3$moduleNumbers
+moduleColors = net3$colors
+modNum_tab = data.frame(table(moduleLabels))
+modCol_tab = data.frame(table(moduleColors))
+modColNum_tab = cbind(moduleLabels = modNum_tab$moduleLabels, 
+                      modCol_tab[order(-modCol_tab$Freq),])
+knitr::kable(modColNum_tab)
+write.csv(modColNum_tab,"results/wgcna/modules.csv")
+rownames(net3$MEs) = labelData$subjectId
+tmp_MEs = net3$MEs
+# rename columns in net3$MEs
+for (i in 1:dim(tmp_MEs)[2]){
+  tmp_mnum = substr(colnames(tmp_MEs)[i], 3, nchar(colnames(tmp_MEs)[i]))
+  if (nchar(tmp_mnum)==1){
+    new_mnum = sprintf("M0%s",tmp_mnum)
+  } else if (nchar(tmp_mnum)==2){
+    new_mnum = sprintf("M%s",tmp_mnum)
+  }
+  colnames(tmp_MEs)[i] = new_mnum
+}
+net3$MEs_colreordered = tmp_MEs[,sort(colnames(tmp_MEs))]
+nums2use = 0:(dim(tmp_MEs)[2]-1)
+for (i in 1:length(nums2use)){
+  colnames(net3$MEs_colreordered)[i] = sprintf("M%d",nums2use[i])
+}
+if (sum(colnames(net3$MEs_colreordered)=="M0")>0){
+  net3$MEs_colreordered = net3$MEs_colreordered[,2:ncol(net3$MEs_colreordered)]
+}
+
+# order rows by subgrp2 and then subjectId
+new_label_data = labelData
+new_label_data2 = new_label_data[order(new_label_data$subgrp,
+                                       order(new_label_data$subjectId)),]
+net3$MEs_colreordered = net3$MEs_colreordered[new_label_data2$subjectId,]
+
+# rename columns in net3$MEs
+for (i in 1:dim(net3$MEs)[2]){
+  tmp_mnum = substr(colnames(net3$MEs)[i], 3, nchar(colnames(net3$MEs)[i]))
+  new_mnum = sprintf("M%s",tmp_mnum)
+  colnames(net3$MEs)[i] = new_mnum
+}
+# all_colors = labels2colors(net3$colors)
+all_colors = net3$colors
+MEs = net3$MEs
+```
+
+## Make TOM plot
+```{r message=FALSE, warning=FALSE}
+Cairo::CairoPNG( 
+  filename = "TOM_plot.png", 
+  width = 10,           
+  height = 6,          
+  units = "in",        
+  dpi = 1200)           
+plotDendroAndColors(net3$dendrograms[[1]], 
+                    net3$colors, "Dynamic Tree Cut",
+                    dendroLabels = FALSE, 
+                    hang = 0.03, 
+                    addGuide = TRUE, 
+                    guideHang = 0.05,
+                    main = "Gene dendrogram and module colors")
+dev.off() 
+```
+
+## Make eigengene network plot
+```{r message=FALSE, warning=FALSE}
+MEcorMat = data.frame(cor(net3$MEs))
+MEcorMat = MEcorMat[!(names(MEcorMat) %in% "M0"), 
+                    !(names(MEcorMat) %in% "M0")]
+
+Cairo::CairoPNG( 
+  filename = "lab_heat.png", 
+  width = 10,           
+  height = 7,          
+  units = "in",        
+  dpi = 1200)           
+heatmap.2(as.matrix(MEcorMat),
+          col = blueWhiteRed(50), 
+          Rowv = TRUE, 
+          trace = "none",
+          cellnote= round(as.matrix(MEcorMat),digits = 2), 
+          notecol = "black",
+          notecex=1,
+          density.info = "none", 
+          key.xlab ="ME Correlation (r)")
+dev.off() 
+
+openxlsx::write.xlsx(MEcorMat,file="results/wgcna/MEcorMat.xlsx",rowNames = TRUE)
+```
+
+## Write out results files
+```{r message=FALSE, warning=FALSE}
+# write ME files
+fname2write = "results/wgcna/module_eigengenes.csv"
+write.csv(net3$MEs,file = fname2write)
+
+# compute module membership and write out to file
+kme_data = signedKME(datExpr = datExpr, datME = net3$MEs)
+for (i in 1:dim(net3$MEs)[2]){
+  colnames(kme_data)[i] = sprintf("kME.%s",colnames(net3$MEs)[i])
+}
+geneInfo = openxlsx::read.xlsx("data/geneInfo_vst.xlsx")
+geneInfo2use = geneInfo[,1]
+
+wgcna_res_data = cbind(geneInfo2use,
+                       data.frame(moduleLabels, moduleColors),
+                       kme_data)
+write.csv(wgcna_res_data, 
+          file = "results/wgcna/wgcna_results_summary.csv", 
+          quote = FALSE, 
+          col.names = FALSE, 
+          row.names = FALSE)
+```
+
+## Run DE analysis on module eigengenes
+```{r message=FALSE, warning=FALSE}
+medata = net3$MEs
+nmods = dim(medata)[2]
+medata$group = factor(labelData$subgrp)
+medata$sex = factor(labelData$sex)
+medata$age = labelData$age
+medata$RIN = labelData$RIN
+covs2use = "group"
+
+res_colnames = c("Module",
+                 "CD_vs_HC.tstat",
+                 "CD_vs_HC.pval",
+                 "CD_vs_HC.fdr")
+group_diff_res = data.frame(matrix(nrow = nmods-1, 
+                                   ncol = length(res_colnames)))
+colnames(group_diff_res) = res_colnames
+
+for (imod in 1:(nmods-1)){
+  module2use = sprintf("M%d",imod)
+  group_diff_res$Module[imod] = module2use
+  mask = medata$group=="CD" | medata$group=="HC"
+  tmp_data = subset(medata, mask)
+  form2use = as.formula(sprintf("%s ~ %s",module2use,covs2use))
+  mod2use = t.test(formula = form2use, data = tmp_data)
+  group_diff_res$CD_vs_HC.tstat[imod] = mod2use$statistic
+  group_diff_res$CD_vs_HC.pval[imod] = mod2use$p.value
+
+}#for (imod in 1:(nmods-1)){
+rownames(group_diff_res) = group_diff_res$Module
+
+group_diff_res$CD_vs_HC.fdr = p.adjust(group_diff_res$CD_vs_HC.pval, 
+                                            method = "fdr")
+group_diff_res
+write.csv(group_diff_res, 
+          file = "results/wgcna/group_diff_res.csv", 
+          quote = FALSE, 
+          col.names = FALSE, 
+          row.names = FALSE)
+```
+
+## Run WGCNA on HC only
+```{r message=FALSE, warning=FALSE}
+# run on HC
+grp2use = "HC"
+datExpr_grp = datExpr[labelData$subgrp==grp2use,]
+datTraits_grp = datTraits[labelData$subgrp==grp2use,]
+
+# Choose a soft-threshold power
+powers = c(1:35)
+if (corrType=="pearson"){
+  corFnc2use = "cor"
+}else if (corrType=="bicor"){
+  corFnc2use = corrType
+}
+sft = pickSoftThreshold(datExpr_grp, 
+                        powerVector = powers, 
+                        verbose = 5,
+                        networkType = networkType,
+                        corFnc = corrType)
+
+makeSoftPowerPlot(sft = sft, powers = powers)
+write.csv(sft[["fitIndices"]],file = "results/wgcna/sft_HC.csv")
+
+softPower = 26
+
+## Run an automated network analysis
+net_tmp = blockwiseModules(datExpr_grp,
+                            power = softPower,
+                            deepSplit = deepSplit,
+                            minModuleSize = minModSize,
+                            mergeCutHeight = modMergeCutHeight, 
+                            detectCutHeight = 0.9999,
+                            corType = corrType,
+                            networkType = networkType,
+                            pamStage = FALSE,
+                            pamRespectsDendro = TRUE,
+                            verbose = 3,
+                            saveTOMs = FALSE,
+                            maxBlockSize = maxBlockSize, 
+                            numericLabels = TRUE)
+
+HC_colors = labels2colors(net_tmp$colors)
+datExpr_HC = datExpr_grp
+table(HC_colors)
+```
+
+## Run WGCNA on CD only
+```{r message=FALSE, warning=FALSE}
+# run on CD
+grp2use = "CD"
+datExpr_grp = datExpr[labelData$subgrp==grp2use,]
+datTraits_grp = datTraits[labelData$subgrp==grp2use,]
+
+# Choose a soft-threshold power
+powers = c(1:35)
+if (corrType=="pearson"){
+  corFnc2use = "cor"
+}else if (corrType=="bicor"){
+  corFnc2use = corrType
+}
+sft = pickSoftThreshold(datExpr_grp, 
+                         powerVector = powers, 
+                         verbose = 5,
+                         networkType = networkType,
+                         corFnc = corrType)
+
+makeSoftPowerPlot(sft = sft, powers = powers)
+write.csv(sft[["fitIndices"]],file = "results/wgcna/sft_CD.csv")
+
+softPower = 26
+
+## Run an automated network analysis
+net_tmp = blockwiseModules(datExpr_grp,
+                            power = softPower,
+                            deepSplit = deepSplit,
+                            minModuleSize = minModSize,
+                            mergeCutHeight = modMergeCutHeight,
+                            detectCutHeight = 0.9999,
+                            corType = corrType,
+                            networkType = networkType,
+                            pamStage = FALSE,
+                            pamRespectsDendro = TRUE,
+                            verbose = 3,
+                            saveTOMs = FALSE,
+                            maxBlockSize = maxBlockSize, 
+                            numericLabels = TRUE)
+
+CD_colors = labels2colors(net_tmp$colors)
+datExpr_CD = datExpr_grp
+table(CD_colors)
+```
+
+## Function for reporting module preservation results
+```{r message=FALSE, warning=FALSE}
+modulePreservationReport <- function(mp){
+  ref = 1
+  test = 2
+  
+  modColors = rownames(mp$preservation$observed[[ref]][[test]])
+  moduleSizes = mp$preservation$Z[[ref]][[test]][, 1]
+  plotMods = !(modColors %in% c("grey", "gold"))
+  text = modColors[plotMods]
+  plotData = cbind(mp$preservation$observed[[ref]][[test]][, 2], 
+                   mp$preservation$Z[[ref]][[test]][, 2])
+  mains = c("Preservation Median rank", "Preservation Zsummary")
+
+  # Start the plot
+  par(mfrow = c(1,2))
+  par(mar = c(4.5,4.5,2.5,1))
+  for (p in 1:2){
+    min = min(plotData[, p], na.rm = TRUE)
+    max = max(plotData[, p], na.rm = TRUE)
+    # Adjust ploting ranges appropriately
+    if (p==2){
+      if (min -max/10) min = -max/10
+      ylim = c(min - 0.1 * (max-min), max + 0.1 * (max-min))
+    } else
+      ylim = c(max + 0.1 * (max-min), min - 0.1 * (max-min))
+    plot(moduleSizes[plotMods], 
+         plotData[plotMods, p], 
+         col = 1, 
+         bg = modColors[plotMods], 
+         pch = 21,
+         main = mains[p],
+         cex = 2.4,
+         ylab = mains[p], 
+         xlab = "Module size", 
+         log = "x",
+         ylim = ylim,
+         xlim = c(10, 2000), 
+         cex.lab = 1.2, 
+         cex.axis = 1.2, 
+         cex.main =1.4)
+    #labelPoints(moduleSizes[plotMods], 
+    #            plotData[plotMods, p], 
+    #            text, 
+    #            cex = 1, 
+    #            offs = 0.08);
+    
+    # For Zsummary, add threshold lines
+    if (p==2) {
+      abline(h=0)
+      abline(h=2, col = "blue", lty = 2)
+      abline(h=10, col = "darkgreen", lty = 2)
+    } # if
+  } # for
+  
+  statsObs = cbind(mp$quality$observed[[ref]][[test]][,-1], 
+                   mp$preservation$observed[[ref]][[test]][,-1])
+  statsZ = cbind(mp$quality$Z[[ref]][[test]][,-1], 
+                 mp$preservation$Z[[ref]][[test]][,-1])
+  
+  sumTable = cbind(statsObs[, c("medianRank.pres", "medianRank.qual")],
+               signif(statsZ[, c("Zsummary.pres", "Zsummary.qual")], 2))
+  sumTable
+} # function modulePreservationReport
+```
+
+## module preservation results
+```{r message=FALSE, warning=FALSE}
+nperm = 1000
+rand_seed = 1
+# all & HC
+setLabels = c("ALL","HC")
+multiExpr = list(ALL = list(data = datExpr), 
+                 HC = list(data = datExpr_HC))
+multiColor = list(ALL = all_colors)
+
+mp_all_HC = modulePreservation(multiExpr,
+                                   multiColor,
+                                   networkType = networkType,
+                                   corFnc = corFnc2use,
+                                   referenceNetworks = 1,
+                                   nPermutations = nperm,
+                                   randomSeed = rand_seed,
+                                   quickCor = 0,
+                                   verbose = 0)
+
+mp_res1 = modulePreservationReport(mp_all_HC)
+mp_res1
+
+# all & CD
+setLabels = c("ALL","CD")
+multiExpr = list(ALL = list(data = datExpr),
+                 CD = list(data = datExpr_CD))
+multiColor = list(ALL = all_colors)
+
+mp_all_CD = modulePreservation(multiExpr,
+                                   multiColor,
+                                   networkType = networkType,
+                                   corFnc = corFnc2use,
+                                   referenceNetworks = 1,
+                                   nPermutations = nperm,
+                                   randomSeed = rand_seed,
+                                   quickCor = 0,
+                                   verbose = 0)
+
+mp_res2 = modulePreservationReport(mp_all_CD)
+mp_res2
+
+openxlsx::write.xlsx(mp_res2,file="results/wgcna/module_preservation_ALL_CD.xlsx",rowNames = TRUE)
+openxlsx::write.xlsx(mp_res1,file="results/wgcna/module_preservation_ALL_HC.xlsx",rowNames = TRUE)
+
+
+mp_res1$module = rownames(mp_res1)
+mp_res1$moduleSize = mp_all_HC$preservation$Z$ref.ALL$inColumnsAlsoPresentIn.HC$moduleSize
+library(ggplot2)
+library(ggrepel)
+g=ggplot(data=mp_res1,aes(x=moduleSize,y=Zsummary.pres,col=module))+
+  geom_point(alpha=0.8, size=5) +
+  theme_bw(base_size=15)+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"))+
+  xlab("ModuleSize") + ylab("Zsummary.pres") +
+  ggtitle( "Preservation Zsummary" ) +
+  theme(plot.title = element_text(size=15,hjust = 0.5))+
+  scale_colour_manual(values = c(mp_res1$module))+
+  
+  theme(legend.position='none')+
+  
+  geom_hline(yintercept = c(2,10),lty=4,lwd=1,col=c("blue","red"))+
+  
+  geom_text_repel(aes(label=module),color="black",alpha = 0.8)
+print(g)
+ggsave(g,filename = "Preservation Zsummary_HC.tiff",height = 8,width = 5,dpi = 1200)
+dev.off()
+
+mp_res2$module = rownames(mp_res2)
+mp_res2$moduleSize = mp_all_CD$preservation$Z$ref.ALL$inColumnsAlsoPresentIn.CD$moduleSize
+g=ggplot(data=mp_res2,aes(x=moduleSize,y=Zsummary.pres,col=module))+
+  geom_point(alpha=0.8, size=5) +
+  theme_bw(base_size=15)+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"))+
+  xlab("ModuleSize") + ylab("Zsummary.pres") +
+  ggtitle( "Preservation Zsummary" ) +
+  theme(plot.title = element_text(size=15,hjust = 0.5))+
+  scale_colour_manual(values = c(mp_res2$module))+
+  
+  theme(legend.position='none')+
+  
+  geom_hline(yintercept = c(2,10),lty=4,lwd=1,col=c("blue","red"))+
+  
+  geom_text_repel(aes(label=module),color="black",alpha = 0.8)
+print(g)
+ggsave(g,filename = "Preservation Zsummary_CD.tiff",height = 8,width = 5,dpi = 1200)
+dev.off()
+```
+
+## Select a module of interest to see the expression of genes
+```{r}
+Cairo::CairoPNG( 
+  filename = "M13_salmon.png", # 文件名称
+  width = 10,           # 宽
+  height = 7,          # 高
+  units = "in",        # 单位
+  dpi = 1200)           # 分辨率
+
+which.module="salmon"
+
+ME=medata[,7]
+par(mfrow=c(2,1), mar=c(0.3, 5.5, 3, 2))
+plotMat(t(scale(datExpr[,moduleColors==which.module ]) ),
+        nrgcols=30,rlabels=F,rcols=which.module,
+        main=which.module, cex.main=2)
+par(mar=c(5, 4.2, 0, 0.7))
+barplot(ME, col=which.module, main="", cex.main=2,
+        ylab="eigengene expression",xlab="samples")
+
+dev.off() 
+```
+
+## mod_trait
+```{r}
+MEs = net3$MEs
+MEs = MEs[,c(1:12)]
+MEs = orderMEs(MEs)
+
+trait_dat = datTraits[,c(8:9)]
+moduleTraitCor = cor(MEs, trait_dat, use = "p")
+
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nrow(MEs))
+
+moduleTraitFDR = p.adjust(moduleTraitPvalue[,1], 
+                                            method = "fdr")
+fdr = as.matrix(moduleTraitFDR)
+moduleTraitFDR2 = p.adjust(moduleTraitPvalue[,2], 
+                                            method = "fdr")
+fdr2 = as.matrix(moduleTraitFDR2)
+
+moduleTraitFDR = cbind(fdr,fdr2)
+moduleTrait = cbind(moduleTraitCor,moduleTraitFDR)
+colnames(moduleTrait)[3:4] = c("fdr1","fdr2")
+
+write.csv(moduleTrait, 
+          file = "results/wgcna/moduleTrait2use.csv", 
+          quote = FALSE, 
+          col.names = TRUE, 
+          row.names = TRUE)
+
+Cairo::CairoPNG( 
+  filename = "modtrait.png", # 文件名称
+  width = 90,           # 宽
+  height = 145,          # 高
+  units = "mm",        # 单位
+  dpi = 1200)           # 分辨率
+
+# Will display correlations and their p-values
+textMatrix = paste(signif(moduleTraitCor, 2), "\n(",
+                   signif(moduleTraitFDR, 1), ")", sep = "")
+dim(textMatrix) = dim(moduleTraitCor)
+par(mar = c(3.5, 2, 1, 2))
+labeledHeatmap(Matrix = moduleTraitCor,
+               xLabels = names(trait_dat),
+               yLabels = names(MEs),
+               ySymbols = names(MEs),
+               colorLabels = FALSE,
+               colors = blueWhiteRed(50),
+               textMatrix = textMatrix,
+               setStdMargins = FALSE,
+               plotLegend = FALSE,
+               keepLegendSpace = FALSE,
+               cex.text = 0.8,
+               cex.lab = 0.8,
+               zlim = c(-1,1),
+               main = paste("Module-trait relationships"))
+
+dev.off() 
+
+```
+
+## data for enrichment
+```{r, message=FALSE, warning=FALSE}
+library(easypackages)
+libraries("pheatmap","reshape2","ggplot2","patchwork","Biobase","readxl")
+source("code_R/genelistOverlap.R")
+datapath = "data4enrichment/"
+
+ndigits2use = 4
+fdr_thresh = 0.05
+fontSize = 20
+dotSize = 10
+
+mod_names = c("M1","M2","M3","M4","M5","M6","M7","M8","M9","M10",
+              "M11","M12")
+nmods = length(mod_names)
+
+load("data4enrichment/genelist4enrichment_final.Rdata")
+
+wgcna_res = read.csv("data4enrichment/wgcna_results_summary.csv")
+backgroundTotal = dim(wgcna_res)[1]
+bglist = wgcna_res$geneInfo2use
+M0_size = dim(subset(wgcna_res, wgcna_res$moduleLabels==0))[1]
+
+DE_list = read.csv("data4enrichment/DE_list.csv")
+
+var2use = "DE"
+
+hc_tmp = subset(DE_list, DE_list$Grp=="HC")
+rownames(hc_tmp) = 1:nmods
+cd_tmp = subset(DE_list, DE_list$Grp=="CD")
+rownames(cd_tmp) = 1:nmods
+
+hc_mods = as.numeric(rownames(hc_tmp)[hc_tmp[,var2use]==1])
+cd_mods = as.numeric(rownames(cd_tmp)[cd_tmp[,var2use]==1])
+
+if (identical(hc_mods,numeric(0))){  hc_mods = NA
+} else if (identical(cd_mods,numeric(0))){
+  cd_mods = NA
+}
+
+mask = logical(length = nmods)
+DE_mods = sort(unique(c(hc_mods, cd_mods)))
+mask[DE_mods] = TRUE
+noneDE_mods = 1:nrow(hc_tmp)
+noneDE_mods = noneDE_mods[!mask]
+
+D_mods = mod_names[DE_mods]
+nD_mods = mod_names[noneDE_mods]
+
+# DE and noneDE modules
+DEmods = DE_mods
+noneDEmods = noneDE_mods
+```
+
+# Tissue-specific enrichment; each module
+```{r, message=FALSE, warning=FALSE}
+geneclasses = c("BroadGenes","BloodGenes","LymphocyteGenes")
+outcols = c("OR","pval","fdr")
+
+out_mats = vector(mode = "list", length = length(geneclasses))
+names(out_mats) = geneclasses
+for (igc in 1:length(geneclasses)){
+  out_res = data.frame(matrix(nrow = length(mod_names), 
+                              ncol = length(outcols)))
+  colnames(out_res) = outcols
+  rownames(out_res) = mod_names
+
+  # intersect genes2 list with background 
+  genes2 = eval(as.name(geneclasses[igc]))
+  mask = is.element(genes2,bglist)
+  genes2 = data.frame(genes2[mask])
+
+  for (imod in 1:length(mod_names)){
+    # filename for module list
+    genes1 = as.data.frame(wgcna_res$geneInfo2use[wgcna_res$moduleLabels==imod])
+    
+    overlap_res = genelistOverlap(genes1,
+                                  genes2,
+                                  backgroundTotal, 
+                                  print_result = FALSE, 
+                                  header = FALSE)
+    out_res[imod,1] = overlap_res[[1]]$OR
+    out_res[imod,2] = overlap_res[[1]]$hypergeo_p
+  }
+  out_res[,3] = p.adjust(out_res[,2], method = "fdr")
+  out_mats[[igc]] = out_res
+}
+# broadly expressed genes富集结果
+write.xlsx(out_mats[[1]],file="results/wgcna/BroadGenes.xlsx", rowNames =T)
+# blood-specific genes富集结果
+write.xlsx(out_mats[[2]],file="results/wgcna/blood.xlsx", rowNames =T)
+# Lymphocyte-specific genes富集结果
+write.xlsx(out_mats[[3]],file="results/wgcna/Lymphocyte.xlsx", rowNames =T)
+```
+
+# Tissue enrichment for genes
+```{r, warning=FALSE, message=FALSE}
+D_genes = as.data.frame(wgcna_res$geneInfo2use[wgcna_res$moduleLabels==3])
+
+geneclassnames = c("BroadGenes","BloodGenes","LymphocyteGenes")
+geneclasses = list(BroadGenes,BloodGenes,LymphocyteGenes)
+res_colnames = c("Mod3")
+
+ORmat = data.frame(matrix(nrow = length(geneclasses), 
+                          ncol = length(res_colnames)))
+logPmat = data.frame(matrix(nrow = length(geneclasses), 
+                            ncol = length(res_colnames)))
+Pmat = data.frame(matrix(nrow = length(geneclasses), 
+                         ncol = length(res_colnames)))
+FDRmat = data.frame(matrix(nrow = length(geneclasses), 
+                           ncol = length(res_colnames)))
+colnames(ORmat) = res_colnames
+colnames(logPmat) = res_colnames
+colnames(Pmat) = res_colnames
+colnames(FDRmat) = res_colnames
+rownames(ORmat) = geneclassnames
+rownames(logPmat) = geneclassnames
+rownames(Pmat) = geneclassnames
+rownames(FDRmat) = geneclassnames
+
+tmp_cols = c("geneInfo2use","moduleLabels","moduleColors","NonZeroMod",geneclassnames)
+enrich_res_table = data.frame(matrix(nrow = dim(wgcna_res)[1], ncol = length(tmp_cols)))
+colnames(enrich_res_table) = tmp_cols
+enrich_res_table[,tmp_cols[1:3]] = wgcna_res[,tmp_cols[1:3]]
+enrich_res_table[,"DEMod"] = 0
+enrich_res_table[is.element(enrich_res_table$moduleLabels,DEmods),"DEMod"] = 1
+library("here")
+for (i in 1:length(geneclasses)){
+  # intersect with background list
+  genes2 = geneclasses[[i]]
+  mask = is.element(genes2,bglist)
+  genes2 = data.frame(genes2[mask])
+
+  overlap_res = genelistOverlap(D_genes,
+                                genes2,
+                                backgroundTotal,
+                                print_result = FALSE,
+                                header = FALSE)
+  ORmat[i,"DE Modules"] = overlap_res[[1]]$OR
+  logPmat[i,"DE Modules"] = -log10(overlap_res[[1]]$hypergeo_p)
+  Pmat[i,"DE Modules"] = overlap_res[[1]]$hypergeo_p
+  
+  genes2export = unique(as.character(overlap_res[[1]]$overlapping_genes))
+
+  mask = is.element(enrich_res_table$geneInfo2use,genes2export)
+  enrich_res_table[, geneclassnames[i]] = 0
+  enrich_res_table[mask, geneclassnames[i]] = 1
+}
+for (i in 1:dim(Pmat)[2]){
+  FDRmat[,i] = p.adjust(Pmat[,i], method = "fdr")
+}
+
+write.csv(enrich_res_table, file = here("data4enrichment","enrich_res_table.csv"))
+write.csv(FDRmat, file = here("data4enrichment","enrich_res_table_FDR.csv"))
+```
+
+# Disease enrichment for mod3
+```{r, warning=FALSE, message=FALSE}
+D_genes = as.data.frame(wgcna_res$geneInfo2use[wgcna_res$moduleLabels==3])
+
+geneclasses = c("gene_1.7_BD_HIP_down",
+                   "gene_1.7_BD_PFC_down", "gene_1.7_BD_STR_down","gene_1.7_SCZ_HIP_down", "gene_1.7_SCZ_PFC_down", "gene_1.7_SCZ_STR_down")
+res_colnames = c("mod3")
+
+# for OR FDR Noverlap
+ORmat = data.frame(matrix(nrow = length(geneclasses), 
+                          ncol = length(res_colnames)))
+logPmat = data.frame(matrix(nrow = length(geneclasses), 
+                            ncol = length(res_colnames)))
+Pmat = data.frame(matrix(nrow = length(geneclasses),
+                         ncol = length(res_colnames)))
+FDRmat = data.frame(matrix(nrow = length(geneclasses),
+                           ncol = length(res_colnames)))
+NOverlapmat = data.frame(matrix(nrow = length(geneclasses), 
+                          ncol = length(res_colnames)))
+
+colnames(ORmat) = res_colnames
+colnames(logPmat) = res_colnames
+colnames(Pmat) = res_colnames
+colnames(FDRmat) = res_colnames
+colnames(NOverlapmat) = res_colnames
+rownames(ORmat) = geneclasses
+rownames(logPmat) = geneclasses
+rownames(Pmat) = geneclasses
+rownames(FDRmat) = geneclasses
+rownames(NOverlapmat) = geneclasses
+
+for (i in 1:length(geneclasses)){
+  # intersect genes2 with background list
+  genes2 = eval(as.name(geneclasses[i]))
+  mask = is.element(genes2,bglist)
+  genes2 = data.frame(genes2[mask])
+  
+  overlap_res = genelistOverlap(D_genes,
+                                genes2,
+                                backgroundTotal,
+                                print_result = FALSE,
+                                header = FALSE)
+  ORmat[i,1] = overlap_res[[1]]$OR
+  logPmat[i,1] = -log10(overlap_res[[1]]$hypergeo_p)
+  Pmat[i,1] = overlap_res[[1]]$hypergeo_p
+  NOverlapmat[i,1] = overlap_res[[1]]$gene_overlap
+}
+
+for (i in 1:dim(Pmat)[2]){
+  FDRmat[,i] = p.adjust(Pmat[,i], method = "fdr")
+}
+
+# for genes
+geneclassnames = c("gene_1.7_BD_HIP_down",
+                   "gene_1.7_BD_PFC_down", "gene_1.7_BD_STR_down","gene_1.7_SCZ_HIP_down", "gene_1.7_SCZ_PFC_down", "gene_1.7_SCZ_STR_down")
+geneclasses = list(gene_1.7_BD_HIP_down,
+                   gene_1.7_BD_PFC_down, gene_1.7_BD_STR_down, gene_1.7_SCZ_HIP_down, gene_1.7_SCZ_PFC_down, gene_1.7_SCZ_STR_down)
+
+ORmat = data.frame(matrix(nrow = length(geneclasses), 
+                          ncol = length(res_colnames)))
+logPmat = data.frame(matrix(nrow = length(geneclasses), 
+                            ncol = length(res_colnames)))
+Pmat = data.frame(matrix(nrow = length(geneclasses), 
+                         ncol = length(res_colnames)))
+FDRmat = data.frame(matrix(nrow = length(geneclasses), 
+                           ncol = length(res_colnames)))
+colnames(ORmat) = res_colnames
+colnames(logPmat) = res_colnames
+colnames(Pmat) = res_colnames
+colnames(FDRmat) = res_colnames
+rownames(ORmat) = geneclassnames
+rownames(logPmat) = geneclassnames
+rownames(Pmat) = geneclassnames
+rownames(FDRmat) = geneclassnames
+
+tmp_cols = c("geneInfo2use","moduleLabels","moduleColors","NonZeroMod",geneclassnames)
+enrich_res_table = data.frame(matrix(nrow = dim(wgcna_res)[1], ncol = length(tmp_cols)))
+colnames(enrich_res_table) = tmp_cols
+enrich_res_table[,tmp_cols[1:3]] = wgcna_res[,tmp_cols[1:3]]
+enrich_res_table[,"DEMod"] = 0
+enrich_res_table[is.element(enrich_res_table$moduleLabels,DEmods),"DEMod"] = 1
+library("here")
+for (i in 1:length(geneclasses)){
+  # intersect with background list
+  genes2 = geneclasses[[i]]
+  mask = is.element(genes2,bglist)
+  genes2 = data.frame(genes2[mask])
+
+  overlap_res = genelistOverlap(D_genes,
+                                genes2,
+                                backgroundTotal,
+                                print_result = FALSE,
+                                header = FALSE)
+  ORmat[i,"DE Modules"] = overlap_res[[1]]$OR
+  logPmat[i,"DE Modules"] = -log10(overlap_res[[1]]$hypergeo_p)
+  Pmat[i,"DE Modules"] = overlap_res[[1]]$hypergeo_p
+  
+  genes2export = unique(as.character(overlap_res[[1]]$overlapping_genes))
+
+  mask = is.element(enrich_res_table$geneInfo2use,genes2export)
+  enrich_res_table[, geneclassnames[i]] = 0
+  enrich_res_table[mask, geneclassnames[i]] = 1
+}
+for (i in 1:dim(Pmat)[2]){
+  FDRmat[,i] = p.adjust(Pmat[,i], method = "fdr")
+}
+
+write.csv(enrich_res_table, file = here("data4enrichment","enrich_res_table.csv"))
+write.csv(FDRmat, file = here("data4enrichment","enrich_res_table_FDR.csv"))
+
+ORmat[,1] = NULL
+logPmat[,1] = NULL
+colnames(ORmat) = "mod3"
+colnames(logPmat) = "mod3"
+
+# 1. 创建画布
+Cairo::CairoPNG( 
+  filename = "disease_enrich.png", # 文件名称
+  width = 100,           # 宽
+  height = 150,          # 高
+  units = "mm",        # 单位
+  dpi = 1200)           # 分辨率
+# 2. 绘图
+zLIM = c(0,4)
+par(mar = c(5.5,10, 1, 1))
+WGCNA::labeledHeatmap(Matrix = logPmat,
+                      xLabels = "mod3", 
+                      yLabels = c("BD_HIP",
+                   "BD_DLPFC", "BD_STR","SCZ_HIP", "SCZ_DLPFC", "SCZ_STR"),
+                      ySymbols = NULL, 
+                      colorLabels = FALSE,
+                      colors = WGCNA::blueWhiteRed(100), 
+                      textMatrix = round(ORmat, digits = 2),
+                      setStdMargins = FALSE, 
+                      cex.text = 2.5, 
+                      zlim = zLIM)
+# 3. 关闭画布
+dev.off() 
+```
+
+# enrichment analysis
+## packages for enrichment
+```{r}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(GSEABase)
+library(ggplot2)
+library(tidyverse)
+```
+
+## read in genes
+```{r message=FALSE, include=FALSE}
+D_genes = as.data.frame(wgcna_res$geneInfo2use[wgcna_res$moduleLabels==3])
+DEG = as.data.frame(D_genes[is.element(wgcna_res$geneInfo2use[wgcna_res$moduleLabels==3], BroadGenes),])
+DEG = as.matrix(DEG)
+head(DEG)
+```
+
+## ===GO数据库
+```{r}
+ego_CC <- enrichGO(gene=DEG, OrgDb= 'org.Hs.eg.db', keyType='SYMBOL', ont="CC", pvalueCutoff= 1,qvalueCutoff= 1)
+ego_MF <- enrichGO(gene=DEG, OrgDb= 'org.Hs.eg.db', keyType='SYMBOL', ont="MF", pvalueCutoff= 1,qvalueCutoff= 1)
+ego_BP <- enrichGO(gene=DEG, OrgDb= 'org.Hs.eg.db', keyType='SYMBOL', ont="BP", pvalueCutoff= 1,qvalueCutoff= 1)
+
+p_BP <- barplot(ego_BP,showCategory = 10) + ggtitle("Biological process")
+p_CC <- barplot(ego_CC,showCategory = 10) + ggtitle("Cellular component")
+p_MF <- barplot(ego_MF,showCategory = 10) + ggtitle("Molecular function")
+plotc <- p_BP/p_CC/p_MF
+plotc
+ggsave('results/wgcna/enrichGO1.png', plotc, width = 8,height = 16,dpi = 1200)
+
+p_BP <- dotplot(ego_BP,showCategory = 10) + ggtitle("Biological process")
+p_CC <- dotplot(ego_CC,showCategory = 10) + ggtitle("Cellular component")
+p_MF <- dotplot(ego_MF,showCategory = 10) + ggtitle("Molecular function")
+plotc <- p_BP/p_CC/p_MF
+plotc
+ggsave('results/wgcna/enrichGO_dot2.png', plotc, width = 8,height = 16,dpi = 1200)
+
+ego_BP <- data.frame(ego_BP)
+ego_CC <- data.frame(ego_CC)
+ego_MF <- data.frame(ego_MF)
+write.csv(ego_BP,file = 'results/wgcna/enrichGO_BP.csv')
+write.csv(ego_CC,file = 'results/wgcna/enrichGO_CC.csv')
+write.csv(ego_MF,file = 'results/wgcna/enrichGO_MF.csv')
+
+```
+
+## === KEGG
+```{r}
+R.utils::setOption( "clusterProfiler.download.method",'auto' )
+genelist <- bitr(gene=DEG, fromType="SYMBOL", toType="ENTREZID", OrgDb='org.Hs.eg.db')
+DEG = as.matrix(DEG)
+# ↑首先将SYMBOL转换为基因号ENTREZID
+genelist <- pull(genelist,ENTREZID)               
+ekegg <- enrichKEGG(gene = genelist, organism = 'hsa',pvalueCutoff = 0.05, qvalueCutoff = 0.2)
+p1 <- barplot(ekegg, showCategory=17)
+p2 <- dotplot(ekegg, showCategory=17)
+plotc = p1/p2
+plotc
+ggsave('results/wgcna/enrichKEGG.png', plot = plotc, width = 8, height = 13, dpi = 1200)
+
+ekegg <- data.frame(ekegg)
+write.csv(ekegg,'results/wgcna/enrichKEGG.csv')
+```
+
+# GEO
+```{r message=FALSE, warning=FALSE}
+#数据下载
+rm(list = ls())
+library(GEOquery)
+library(genefilter)
+gse_number = "GSE53987"
+eSet <- getGEO(gse_number, 
+               destdir = '.', 
+               getGPL = F)
+eSet0 = eSet
+eSet = eSet[[1]] 
+exp <- exprs(eSet)
+exp = log2(exp+1)  
+exp= as.matrix(exp)
+
+eset.filter <- nsFilter(eSet, require.entrez=F, remove.dupEntrez=F) 
+
+eset.filter$filter.log 
+
+eset.filter <- eset.filter$eset 
+
+exp <- exprs(eset.filter)
+# data.mat <- t(exp[order(apply(exp, 1, mad), decreasing = T)[1:5000],])
+
+pd <- pData(eSet)
+
+p = identical(rownames(pd),colnames(exp));p
+
+gpl_number <- eSet@annotation  
+save(gse_number,pd,exp,gpl_number,file = "../GEO/step1output.Rdata")
+```
+
+
+```{r message=FALSE, warning=FALSE}
+load(file = "./GEO/step1output.Rdata")
+exp = exp[,c(19:36,55:68,86:104,122:136,154:171,188:205)]
+pd = pd[c(19:36,55:68,86:104,122:136,154:171,188:205),]
+
+library(stringr)
+
+find_anno(gpl_number)   
+ids <- AnnoProbe::idmap('GPL570') 
+exp = as.data.frame(exp)
+exp <- mutate(exp,probe_id=rownames(exp))
+exp2use = merge(exp,ids,by.x="probe_id", by.y="probe_id")
+
+exp2use=exp2use[!duplicated(exp2use$symbol),]
+
+rownames(exp2use)=exp2use$symbol 
+
+exp2use <- na.omit(exp2use ) 
+exp2use = exp2use[,2:103]
+
+exp2 = exp2use
+colnames(exp2) = pd$title
+exp_hipp = exp2[,1:32]
+exp_pfc = exp2[,33:66]
+exp_str = exp2[,67:102]
+
+Group_hipp = c(rep("control",times=18),
+          rep("scz",times=14))
+Group_pfc = c(rep("control",times=19),
+          rep("scz",times=15))
+Group_str = c(rep("control",times=18),
+          rep("scz",times=18))
+
+Group_hipp = factor(Group_hipp,
+               levels = c("control","scz"))
+Group_pfc = factor(Group_pfc,
+               levels = c("control","scz"))
+Group_str = factor(Group_str,
+               levels = c("control","scz"))
+Group_hipp
+Group_pfc
+Group_str
+
+save(exp_hipp,exp_pfc,exp_str,Group_hipp,Group_pfc,Group_str,file = "../data/geo2use.rdata")
+```
+
+## Run WGCNA on exp_hipp
+```{r message=FALSE, warning=FALSE}
+# run on hipp
+datExpr_grp = t(exp_hipp)
+# Choose a soft-threshold power
+powers = c(1:35)
+if (corrType=="pearson"){
+  corFnc2use = "cor"
+}else if (corrType=="bicor"){
+  corFnc2use = corrType
+}
+sft = pickSoftThreshold(datExpr_grp, 
+                        powerVector = powers, 
+                        verbose = 5,
+                        networkType = networkType,
+                        corFnc = corrType)
+
+makeSoftPowerPlot(sft = sft, powers = powers)
+write.csv(sft[["fitIndices"]],file = "results/wgcna/sft_HC.csv")
+
+softPower = 6
+
+## Run an automated network analysis
+net_tmp = blockwiseModules(datExpr_grp,
+                            power = softPower,
+                            deepSplit = deepSplit,
+                            minModuleSize = minModSize,
+                            mergeCutHeight = modMergeCutHeight, 
+                            detectCutHeight = 0.9999,
+                            corType = corrType,
+                            networkType = networkType,
+                            pamStage = FALSE,
+                            pamRespectsDendro = TRUE,
+                            verbose = 3,
+                            saveTOMs = FALSE,
+                            maxBlockSize = maxBlockSize, 
+                            numericLabels = TRUE)
+
+hipp_colors = labels2colors(net_tmp$colors)
+datExpr_hipp = datExpr_grp
+table(hipp_colors)
+```
+
+## Run WGCNA on exp_pfc
+```{r message=FALSE, warning=FALSE}
+# run on HC
+datExpr_grp = t(exp_pfc)
+
+# Choose a soft-threshold power
+powers = c(1:35)
+if (corrType=="pearson"){
+  corFnc2use = "cor"
+}else if (corrType=="bicor"){
+  corFnc2use = corrType
+}
+sft = pickSoftThreshold(datExpr_grp, 
+                        powerVector = powers, 
+                        verbose = 5,
+                        networkType = networkType,
+                        corFnc = corrType)
+
+makeSoftPowerPlot(sft = sft, powers = powers)
+write.csv(sft[["fitIndices"]],file = "results/wgcna/sft_HC.csv")
+
+softPower = 14
+
+## Run an automated network analysis
+net_tmp = blockwiseModules(datExpr_grp,
+                            power = softPower,
+                            deepSplit = deepSplit,
+                            minModuleSize = minModSize,
+                            mergeCutHeight = modMergeCutHeight, 
+                            detectCutHeight = 0.9999,
+                            corType = corrType,
+                            networkType = networkType,
+                            pamStage = FALSE,
+                            pamRespectsDendro = TRUE,
+                            verbose = 3,
+                            saveTOMs = FALSE,
+                            maxBlockSize = maxBlockSize, 
+                            numericLabels = TRUE)
+
+pfc_colors = labels2colors(net_tmp$colors)
+datExpr_pfc = datExpr_grp
+table(pfc_colors)
+```
+
+## Run WGCNA on exp_str
+```{r message=FALSE, warning=FALSE}
+# run on HC
+datExpr_grp = t(exp_str)
+
+# Choose a soft-threshold power
+powers = c(1:35)
+if (corrType=="pearson"){
+  corFnc2use = "cor"
+}else if (corrType=="bicor"){
+  corFnc2use = corrType
+}
+sft = pickSoftThreshold(datExpr_grp, 
+                        powerVector = powers, 
+                        verbose = 5,
+                        networkType = networkType,
+                        corFnc = corrType)
+
+makeSoftPowerPlot(sft = sft, powers = powers)
+write.csv(sft[["fitIndices"]],file = "results/wgcna/sft_HC.csv")
+
+softPower = 8
+
+## Run an automated network analysis
+net_tmp = blockwiseModules(datExpr_grp,
+                            power = softPower,
+                            deepSplit = deepSplit,
+                            minModuleSize = minModSize,
+                            mergeCutHeight = modMergeCutHeight, 
+                            detectCutHeight = 0.9999,
+                            corType = corrType,
+                            networkType = networkType,
+                            pamStage = FALSE,
+                            pamRespectsDendro = TRUE,
+                            verbose = 3,
+                            saveTOMs = FALSE,
+                            maxBlockSize = maxBlockSize, 
+                            numericLabels = TRUE)
+
+str_colors = labels2colors(net_tmp$colors)
+datExpr_str = datExpr_grp
+table(str_colors)
+```
+
+
+## module preservation results
+```{r message=FALSE, warning=FALSE}
+nperm = 1000
+rand_seed = 1
+# blood & hipp
+setLabels = c("ALL","hipp")
+multiExpr = list(ALL = list(data = datExpr), 
+                 hipp = list(data = datExpr_hipp))
+multiColor = list(ALL = all_colors)
+
+mp_all_hipp = modulePreservation(multiExpr,
+                                   multiColor,
+                                   networkType = networkType,
+                                   corFnc = corFnc2use,
+                                   referenceNetworks = 1,
+                                   nPermutations = nperm,
+                                   randomSeed = rand_seed,
+                                   quickCor = 0,
+                                   verbose = 0)
+
+mp_res3 = modulePreservationReport(mp_all_hipp)
+mp_res3
+
+# blood & pfc
+setLabels = c("ALL","pfc")
+multiExpr = list(ALL = list(data = datExpr),
+                 pfc = list(data = datExpr_pfc))
+multiColor = list(ALL = all_colors)
+
+mp_all_pfc = modulePreservation(multiExpr,
+                                   multiColor,
+                                   networkType = networkType,
+                                   corFnc = corFnc2use,
+                                   referenceNetworks = 1,
+                                   nPermutations = nperm,
+                                   randomSeed = rand_seed,
+                                   quickCor = 0,
+                                   verbose = 0)
+
+mp_res4 = modulePreservationReport(mp_all_pfc)
+mp_res4
+
+# blood & str
+setLabels = c("ALL","str")
+multiExpr = list(ALL = list(data = datExpr),
+                 str = list(data = datExpr_str))
+multiColor = list(ALL = all_colors)
+
+mp_all_str = modulePreservation(multiExpr,
+                                   multiColor,
+                                   networkType = networkType,
+                                   corFnc = corFnc2use,
+                                   referenceNetworks = 1,
+                                   nPermutations = nperm,
+                                   randomSeed = rand_seed,
+                                   quickCor = 0,
+                                   verbose = 0)
+
+mp_res5 = modulePreservationReport(mp_all_str)
+mp_res5
+
+openxlsx::write.xlsx(mp_res3,file="results/wgcna/module_preservation_hipp.xlsx",rowNames = TRUE)
+openxlsx::write.xlsx(mp_res4,file="results/wgcna/module_preservation_pfc.xlsx",rowNames = TRUE)
+openxlsx::write.xlsx(mp_res5,file="results/wgcna/module_preservation_str.xlsx",rowNames = TRUE)
+
+mp_res3$module = rownames(mp_res3)
+mp_res3$moduleSize = mp_all_hipp$preservation$Z$ref.ALL$inColumnsAlsoPresentIn.hipp$moduleSize
+library(ggplot2)
+library(ggrepel)
+g=ggplot(data=mp_res3,aes(x=moduleSize,y=Zsummary.pres,col=module))+
+  geom_point(alpha=0.8, size=5) +
+  theme_bw(base_size=15)+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"))+
+  xlab("ModuleSize") + ylab("Zsummary.pres") +
+  ggtitle( "Preservation Zsummary" ) +
+  theme(plot.title = element_text(size=15,hjust = 0.5))+
+  scale_colour_manual(values = c(mp_res3$module))+
+  
+  theme(legend.position='none')+
+  
+  geom_hline(yintercept = c(2,10),lty=4,lwd=1,col=c("blue","red"))+
+  
+  geom_text_repel(aes(label=module),color="black",alpha = 0.8)
+print(g)
+ggsave(g,filename = "Preservation Zsummary_hipp.tiff",height = 8,width = 5,dpi = 1200)
+dev.off()
+
+mp_res4$module = rownames(mp_res4)
+mp_res4$moduleSize = mp_all_pfc$preservation$Z$ref.ALL$inColumnsAlsoPresentIn.pfc$moduleSize
+g=ggplot(data=mp_res4,aes(x=moduleSize,y=Zsummary.pres,col=module))+
+  geom_point(alpha=0.8, size=5) +
+  theme_bw(base_size=15)+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"))+
+  xlab("ModuleSize") + ylab("Zsummary.pres") +
+  ggtitle( "Preservation Zsummary" ) +
+  theme(plot.title = element_text(size=15,hjust = 0.5))+
+  scale_colour_manual(values = c(mp_res4$module))+
+  
+  theme(legend.position='none')+
+  
+  geom_hline(yintercept = c(2,10),lty=4,lwd=1,col=c("blue","red"))+
+  
+  geom_text_repel(aes(label=module),color="black",alpha = 0.8)
+print(g)
+ggsave(g,filename = "Preservation Zsummary_pfc.tiff",height = 8,width = 5,dpi = 1200)
+dev.off()
+
+mp_res5$module = rownames(mp_res5)
+mp_res5$moduleSize = mp_all_str$preservation$Z$ref.ALL$inColumnsAlsoPresentIn.str$moduleSize
+g=ggplot(data=mp_res4,aes(x=moduleSize,y=Zsummary.pres,col=module))+
+  geom_point(alpha=0.8, size=5) +
+  theme_bw(base_size=15)+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"))+
+  xlab("ModuleSize") + ylab("Zsummary.pres") +
+  ggtitle( "Preservation Zsummary" ) +
+  theme(plot.title = element_text(size=15,hjust = 0.5))+
+  scale_colour_manual(values = c(mp_res5$module))+
+  
+  theme(legend.position='none')+
+  
+  geom_hline(yintercept = c(2,10),lty=4,lwd=1,col=c("blue","red"))+
+  
+  geom_text_repel(aes(label=module),color="black",alpha = 0.8)
+print(g)
+ggsave(g,filename = "Preservation Zsummary_str.tiff",height = 8,width = 5,dpi = 1200)
+dev.off()
+
+```
+
+
+
